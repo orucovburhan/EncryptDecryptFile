@@ -10,9 +10,12 @@ class FileXorCryptoWithProgress
     static long processedBytes = 0;
     static volatile bool processingDone = false;
 
+    // New: cancellation flag set when user presses Enter
+    static volatile bool cancelRequested = false;
+
     static void Main()
     {
-        Console.WriteLine("=== Simple XOR File Encryptor/Decryptor (with progress) ===");
+        Console.WriteLine("=== Simple XOR File Encryptor/Decryptor (with progress + cancel) ===");
 
         // 1) Input file
         string inputPath;
@@ -72,57 +75,122 @@ class FileXorCryptoWithProgress
 
         // Start the progress thread
         processingDone = false;
+        cancelRequested = false;
         Thread progressThread = new Thread(ShowProgressLoop)
         {
             IsBackground = true
         };
         progressThread.Start();
 
+        // Start a small watcher thread that detects Enter key to request cancellation.
+        Thread cancelWatcher = new Thread(() =>
+        {
+            // Non-blocking key check loop: user presses Enter to cancel
+            while (!processingDone && !cancelRequested)
+            {
+                if (Console.KeyAvailable)
+                {
+                    var keyInfo = Console.ReadKey(intercept: true);
+                    if (keyInfo.Key == ConsoleKey.Enter)
+                    {
+                        cancelRequested = true;
+                        break;
+                    }
+                }
+                Thread.Sleep(50);
+            }
+        })
+        { IsBackground = true };
+        cancelWatcher.Start();
+
+        bool success = false;
         try
         {
             ProcessFileWithXor(inputPath, outputPath, key);
 
-            if (overwrite)
+            // If user requested cancel during processing, do not proceed to replace/finish.
+            if (cancelRequested)
             {
-                // Replace original with temp safely (try File.Replace then fallback to delete/move)
-                try
+                // signal threads and cleanup below
+            }
+            else
+            {
+                // Only replace original if not cancelled and overwrite requested
+                if (overwrite)
                 {
-                    File.Replace(outputPath, inputPath, null);
+                    try
+                    {
+                        File.Replace(outputPath, inputPath, null);
+                    }
+                    catch
+                    {
+                        // fallback
+                        File.Delete(inputPath);
+                        File.Move(outputPath, inputPath);
+                    }
+                    outputPath = inputPath; // final path is original
                 }
-                catch
-                {
-                    File.Delete(inputPath);
-                    File.Move(outputPath, inputPath);
-                }
-                outputPath = inputPath; // final path is original
+
+                // signal success
+                success = true;
+
+                // Ensure processedBytes equals totalBytes on finish
+                Interlocked.Exchange(ref processedBytes, totalBytes);
             }
 
-            // Signal progress thread that processing is done
+            // Signal processing done (so progress thread stops)
             processingDone = true;
 
-            // Ensure processedBytes equals totalBytes on finish
-            Interlocked.Exchange(ref processedBytes, totalBytes);
-
-            // Give progress thread a moment to print 100%
+            // Give progress thread a moment to print final line
             progressThread.Join(1000);
+            cancelWatcher.Join(100);
 
             // Move to next line (progress used \r)
             Console.WriteLine();
 
-            Console.WriteLine($"{(operation == "e" ? "Encrypted" : "Decrypted")} file saved to: {outputPath}");
+            if (cancelRequested)
+            {
+                // Rollback: delete the partially written output file if it exists
+                try
+                {
+                    if (File.Exists(outputPath))
+                    {
+                        File.Delete(outputPath);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine();
+                    Console.WriteLine("Failed to delete partial output file: " + ex.Message);
+                }
 
-            // Show sample bytes after processing
-            byte[] afterSample = ReadSampleBytes(outputPath, 16);
-            Console.WriteLine("First bytes of output (hex): " + BytesToHex(afterSample));
-            Console.WriteLine("If the hex above differs from the first-hex printed earlier, the file changed.");
+                Console.WriteLine("Operation cancelled by user. Partial output removed; original file left unchanged.");
+            }
+            else
+            {
+                Console.WriteLine($"{(operation == "e" ? "Encrypted" : "Decrypted")} file saved to: {outputPath}");
+
+                // Show sample bytes after processing
+                byte[] afterSample = ReadSampleBytes(outputPath, 16);
+                Console.WriteLine("First bytes of output (hex): " + BytesToHex(afterSample));
+                Console.WriteLine("If the hex above differs from the first-hex printed earlier, the file changed.");
+            }
         }
         catch (Exception ex)
         {
-            // make sure progress thread exits
+            // make sure progress thread and cancel watcher exit
             processingDone = true;
+            cancelWatcher.Join(100);
             progressThread.Join(500);
             Console.WriteLine();
             Console.WriteLine("Error processing file: " + ex.Message);
+
+            // try to remove the partial output file on error
+            try
+            {
+                if (File.Exists(outputPath)) File.Delete(outputPath);
+            }
+            catch { /* ignore */ }
         }
     }
 
@@ -141,6 +209,12 @@ class FileXorCryptoWithProgress
             int read;
             while ((read = inFs.Read(buffer, 0, buffer.Length)) > 0)
             {
+                // Check cancellation: if user pressed Enter, stop processing as soon as possible.
+                if (cancelRequested)
+                {
+                    break;
+                }
+
                 for (int i = 0; i < read; i++)
                 {
                     buffer[i] ^= key;
@@ -151,13 +225,16 @@ class FileXorCryptoWithProgress
                 // atomically add the number of bytes processed
                 Interlocked.Add(ref processedBytes, read);
             }
+
+            // flush to ensure partial data is written if user cancels (we will delete file later)
+            outFs.Flush();
         }
     }
 
     // Progress loop running on a background thread
     static void ShowProgressLoop()
     {
-        const int refreshMs = 150000000; // how often to update
+        const int refreshMs = 150; // how often to update
         DateTime lastUpdate = DateTime.MinValue;
         while (!processingDone)
         {
@@ -170,8 +247,13 @@ class FileXorCryptoWithProgress
             Thread.Sleep(50);
         }
 
-        // Final guaranteed print showing 100%
-        PrintProgressLine(final: true);
+        // Final print: if cancelled, do not force 100%
+        PrintProgressLine(final: !cancelRequested);
+
+        if (cancelRequested)
+        {
+            Console.Write(" (cancelled)");
+        }
     }
 
     static void PrintProgressLine(bool final = false)
